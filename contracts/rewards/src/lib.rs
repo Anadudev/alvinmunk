@@ -39,6 +39,16 @@ pub enum Error {
     NotFunded = 12, // proof-of-funding gate (belts/08): no external value received
     RewardExhausted = 13, // the reward's fixed supply (`max_claims`) is used up
     InvalidSupply = 14, // a supply cap below the claims already paid
+    StreakTooShort = 15,
+}
+
+/// Weekly retention streak, matching `quest_registry::Streak`.
+#[contracttype]
+#[derive(Clone)]
+pub struct Streak {
+    pub weeks: u32,
+    pub last_week: u64,
+    pub best: u32,
 }
 
 /// One row of the rank->reward unlock table.
@@ -70,6 +80,7 @@ pub struct RewardInfo {
     pub active: bool,
     pub max_claims: u32, // 0 = unlimited
     pub claims: u32,
+    pub min_streak: u32, // 0 = none
 }
 
 #[contracttype]
@@ -88,6 +99,8 @@ pub enum DataKey {
     RequireFunding,              // bool — enforce proof-of-funding on claim (off on testnet)
     Funded(Address),             // bool — verified to have received external value (belts/08)
     RewardStats(u32),            // RewardStats — supply cap + running claim count
+    QuestRegistry,               // QuestRegistry contract address
+    RewardStreak(u32),           // u32 min streak (weeks) required for reward
 }
 
 #[contract]
@@ -208,6 +221,42 @@ impl RewardsContract {
         Self::stats(&env, reward_id)
     }
 
+    /// Register the QuestRegistry contract address for streak-gated reward verification. Admin-only.
+    pub fn set_quest_registry(env: Env, quest_registry: Address) {
+        Self::admin(&env).require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::QuestRegistry, &quest_registry);
+    }
+
+    pub fn get_quest_registry(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::QuestRegistry)
+    }
+
+    /// Set the minimum weekly quest streak required to claim a reward (0 = none). Admin-only.
+    pub fn set_reward_min_streak(env: Env, reward_id: u32, weeks: u32) {
+        Self::admin(&env).require_auth();
+        if !env.storage().persistent().has(&DataKey::Reward(reward_id)) {
+            panic_with_error!(&env, Error::RewardNotFound);
+        }
+        let key = DataKey::RewardStreak(reward_id);
+        if weeks == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &weeks);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+        }
+        env.events()
+            .publish((symbol_short!("rwd_strk"), reward_id), weeks);
+    }
+
+    /// Read the minimum streak requirement for a reward (0 = no streak required).
+    pub fn get_reward_min_streak(env: Env, reward_id: u32) -> u32 {
+        Self::min_streak(&env, reward_id)
+    }
+
     pub fn get_reward(env: Env, reward_id: u32) -> Option<RewardEntry> {
         env.storage().persistent().get(&DataKey::Reward(reward_id))
     }
@@ -227,6 +276,7 @@ impl RewardsContract {
                 .get::<DataKey, RewardEntry>(&DataKey::Reward(id))
             {
                 let stats = Self::stats(&env, id);
+                let min_streak = Self::min_streak(&env, id);
                 out.push_back(RewardInfo {
                     id: e.id,
                     threshold: e.threshold,
@@ -234,6 +284,7 @@ impl RewardsContract {
                     active: e.active,
                     max_claims: stats.max_claims,
                     claims: stats.claims,
+                    min_streak,
                 });
             }
         }
@@ -284,6 +335,33 @@ impl RewardsContract {
         let score: u64 = env.invoke_contract(&reputation, &func, args);
         if score < entry.threshold {
             panic_with_error!(&env, Error::BelowThreshold);
+        }
+
+        // Cross-contract read of the weekly retention streak from QuestRegistry (Feature #294)
+        let min_streak = Self::min_streak(&env, reward_id);
+        if min_streak > 0 {
+            let quest_registry: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::QuestRegistry)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+            let streak: Streak = env.invoke_contract(
+                &quest_registry,
+                &Symbol::new(&env, "get_streak"),
+                soroban_sdk::vec![&env, to.to_val()],
+            );
+
+            let current_week: u64 = env.invoke_contract(
+                &quest_registry,
+                &symbol_short!("get_week"),
+                soroban_sdk::vec![&env],
+            );
+
+            let is_live = streak.last_week >= current_week.saturating_sub(1);
+            if !is_live || streak.weeks < min_streak {
+                panic_with_error!(&env, Error::StreakTooShort);
+            }
         }
 
         // Global treasury circuit breaker (belts/08): bound total daily payout so even
@@ -433,6 +511,13 @@ impl RewardsContract {
                 max_claims: 0,
                 claims: 0,
             })
+    }
+
+    fn min_streak(env: &Env, reward_id: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RewardStreak(reward_id))
+            .unwrap_or(0)
     }
 
     fn save_stats(env: &Env, reward_id: u32, stats: &RewardStats) {

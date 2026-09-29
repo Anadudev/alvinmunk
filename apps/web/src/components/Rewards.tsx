@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { getWallet } from '@/lib/wallet';
 import { txExplorerUrl } from '@/lib/stellar';
 import { getEarnedScore } from '@/lib/reputation';
+import { getStreak } from '@/lib/quests';
 import { claimReward, getRewards, getUsdcBalance, isClaimed, stroopsToUsdc, usdcToStroops, type RewardEntry } from '@/lib/rewards';
 import {
   getAnchorConfig,
@@ -32,6 +33,7 @@ const REWARD_ERRORS: Record<number, string> = {
   10: 'This account is under review and can’t claim right now.',
   12: 'You need to receive funds first before claiming (mainnet rule).',
   13: 'This reward’s pool is used up.',
+  15: 'You need a longer quest streak to claim this reward.',
 };
 
 /**
@@ -43,6 +45,7 @@ type Row = RewardEntry & { claimed: boolean };
 
 export function Rewards({ address }: { address: string }) {
   const [earned, setEarned] = useState<number | null>(null);
+  const [streak, setStreak] = useState<number>(0);
   const [rows, setRows] = useState<Row[] | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
   const [hash, setHash] = useState<string | null>(null);
@@ -51,11 +54,13 @@ export function Rewards({ address }: { address: string }) {
   const refresh = useCallback(async () => {
     // Timeout the gating reads so a slow RPC degrades to "no rewards" instead of an
     // endless skeleton in front of a tester/judge.
-    const [e, table] = await Promise.all([
+    const [e, table, s] = await Promise.all([
       withTimeout(getEarnedScore(address, address), 12_000, 'score').catch(() => 0),
       withTimeout(getRewards(address), 12_000, 'rewards').catch(() => [] as RewardEntry[]),
+      withTimeout(getStreak(address, address), 12_000, 'streak').catch(() => ({ weeks: 0, best: 0, lastWeek: 0 })),
     ]);
     setEarned(e);
+    setStreak(s.weeks);
     const withClaimed = await Promise.all(
       table.map(async (r) => ({
         ...r,
@@ -112,7 +117,9 @@ export function Rewards({ address }: { address: string }) {
         ) : (
           <ul className="flex flex-col gap-2">
             {rows.map((r) => {
-              const unlocked = (earned ?? 0) >= Number(r.threshold);
+              const minStreak = r.min_streak ?? 0;
+              const hasStreak = minStreak === 0 || streak >= minStreak;
+              const unlocked = (earned ?? 0) >= Number(r.threshold) && hasStreak;
               const cap = r.max_claims ?? 0;
               const left = cap > 0 ? Math.max(0, cap - (r.claims ?? 0)) : null;
               const soldOut = left === 0;
@@ -127,6 +134,11 @@ export function Rewards({ address }: { address: string }) {
                     {left !== null && (
                       <span className="ml-2 text-xs text-muted-foreground">
                         · {soldOut ? 'none left' : `${left} of ${cap} left`}
+                      </span>
+                    )}
+                    {minStreak > 0 && (
+                      <span className="ml-2 text-xs text-muted-foreground">
+                        · needs a {minStreak}-week streak (you: {streak})
                       </span>
                     )}
                   </span>
