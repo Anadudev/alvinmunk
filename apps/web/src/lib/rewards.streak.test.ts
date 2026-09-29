@@ -1,11 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { Wallet } from './wallet';
 
 const readContractMock = vi.fn();
-const invokeAndWaitMock = vi.fn();
+const invokeAndWaitHashMock = vi.fn();
 
 vi.mock('./contracts', () => ({
   readContract: (...a: unknown[]) => readContractMock(...a),
-  invokeAndWait: (...a: unknown[]) => invokeAndWaitMock(...a),
+  invokeAndWait: vi.fn(),
+  invokeAndWaitHash: (...a: unknown[]) => invokeAndWaitHashMock(...a),
   rewardsId: () => 'CREWARDS',
   args: { u32: (n: number) => ({ __u32: n }), addr: (a: string) => ({ __addr: a }) },
 }));
@@ -15,7 +17,7 @@ import { getRewardMinStreak, setRewardMinStreak } from './rewards';
 describe('streak-gated rewards client', () => {
   beforeEach(() => {
     readContractMock.mockReset();
-    invokeAndWaitMock.mockReset();
+    invokeAndWaitHashMock.mockReset();
   });
 
   it('reads get_reward_min_streak for the reward id', async () => {
@@ -29,15 +31,15 @@ describe('streak-gated rewards client', () => {
     await expect(getRewardMinStreak(1, 'GSOURCE')).resolves.toBe(0);
   });
 
-  it('calls set_reward_min_streak via invokeAndWait', async () => {
-    invokeAndWaitMock.mockResolvedValueOnce(undefined);
-    const mockWallet = { address: 'GADMIN' } as any;
-    await setRewardMinStreak(mockWallet, 1, 4);
-    expect(invokeAndWaitMock).toHaveBeenCalledWith(
+  it('sets the minimum with set_reward_min_streak and resolves the tx hash', async () => {
+    invokeAndWaitHashMock.mockResolvedValueOnce('abc123');
+    const wallet = { address: 'GADMIN' } as unknown as Wallet;
+    await expect(setRewardMinStreak(wallet, 1, 4)).resolves.toBe('abc123');
+    expect(invokeAndWaitHashMock).toHaveBeenCalledWith(
       'CREWARDS',
       'set_reward_min_streak',
       [{ __u32: 1 }, { __u32: 4 }],
-      mockWallet,
+      wallet,
     );
   });
 });

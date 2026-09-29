@@ -539,7 +539,30 @@ removes the cap with `0`. Once `claims` reaches the cap, `claim_reward` reverts 
 |------|-------------|
 | `u32` | `max_claims` — the new cap (`0` = unlimited) |
 
-**Contract source**: `rewards/src/lib.rs` → `fn tip()` / `fn add_reward()` / `fn set_reward_supply()` / `fn claim_reward()`
+### `rwd_strk` (Reward Streak Requirement Set)
+
+An admin requires a live weekly quest streak of at least `weeks` to claim a reward, on
+top of its Earned-XP threshold, or removes the requirement with `0`. `claim_reward` then
+reads the claimer's `quest_registry.get_streak` (the QuestRegistry set by
+`set_quest_registry`) and reverts with `StreakTooShort` (#18) when `weeks` is below the
+minimum. `get_streak` reads a lapsed run as `0` weeks (see [`Streak`](#streak)), so a stale
+stored count never passes. Rewards without a minimum are unchanged and make no
+QuestRegistry call. A non-zero minimum reverts with `QuestRegistryNotSet` (#19) until
+`set_quest_registry` has run; the minimum lives under its own key, so stored `RewardEntry`
+rows keep their shape.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **topics[0]** | `Symbol("rwd_strk")` | Event discriminator |
+| **topics[1]** | `u32` | `reward_id` — the reward row ID |
+
+**Data**:
+
+| Type | Description |
+|------|-------------|
+| `u32` | `weeks` — the live streak now required (`0` = none) |
+
+**Contract source**: `rewards/src/lib.rs` → `fn tip()` / `fn add_reward()` / `fn set_reward_supply()` / `fn set_reward_min_streak()` / `fn claim_reward()`
 
 ```rust
 // Tip:
@@ -553,6 +576,10 @@ env.events().publish(
 // Reward supply set:
 env.events().publish(
     (symbol_short!("rwd_cap"), reward_id), max_claims);
+
+// Reward streak requirement set:
+env.events().publish(
+    (symbol_short!("rwd_strk"), reward_id), weeks);
 
 // Reward claimed:
 env.events().publish(
@@ -581,6 +608,7 @@ Quick-reference table of all event discriminators and their sub-types.
 | `tipped` | *(none)* | Rewards | [↑](#tipped) |
 | `rwd_set` | *(none)* | Rewards | [↑](#rwd_set-reward-registeredupdated) |
 | `rwd_cap` | *(none)* | Rewards | [↑](#rwd_cap-reward-supply-set) |
+| `rwd_strk` | *(none)* | Rewards | [↑](#rwd_strk-reward-streak-requirement-set) |
 | `reward` | *(none)* | Rewards | [↑](#reward-reward-claimed) |
 
 ---
@@ -832,7 +860,10 @@ pub struct RewardEntry {
 ### `RewardStats` / `RewardInfo`
 
 `get_reward_stats(id)` returns the supply counters; `get_rewards()` returns each row
-joined with them. `max_claims == 0` means unlimited.
+joined with them and with its streak requirement (`get_reward_min_streak(id)`, also a
+view). `max_claims == 0` means unlimited; `min_streak == 0` means no streak is required.
+`min_streak` was appended when streak-gated rewards landed, so a contract deployed before
+them returns rows without it; read a missing field as `0`.
 
 ```rust
 pub struct RewardStats {
@@ -847,6 +878,7 @@ pub struct RewardInfo {
     pub active: bool,
     pub max_claims: u32,
     pub claims: u32,
+    pub min_streak: u32,
 }
 ```
 
@@ -881,7 +913,7 @@ export const EVENTS = {
   QUEST: 'quest',
   TIPPED: 'tipped',
   REWARD: 'reward',
-  // handle, meta, gate, unlocked, streak, rwd_set, rwd_cap, attester are not yet mirrored
+  // handle, meta, gate, unlocked, streak, rwd_set, rwd_cap, rwd_strk, attester are not yet mirrored
 } as const;
 ```
 

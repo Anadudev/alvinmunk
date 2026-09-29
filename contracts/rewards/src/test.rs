@@ -1,7 +1,8 @@
 #![cfg(test)]
 //! Integration tests for the Rewards -> Reputation CROSS-CONTRACT read
 //! (`claim_reward` gates USDC payout on `get_earned`) + the USDC SAC transfer +
-//! the on-chain reward registry (caller can never dictate the payout amount).
+//! the on-chain reward registry (caller can never dictate the payout amount), and the
+//! Rewards -> QuestRegistry `get_streak` read behind streak-gated rewards.
 extern crate std;
 use super::*;
 use alvinmunk_quest_registry::{QuestRegistryContract, QuestRegistryContractClient};
@@ -10,9 +11,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     testutils::{
         storage::{Persistent as _, Temporary as _},
-        Address as _, Ledger as _,
+        Address as _, Events as _, Ledger as _,
     },
-    token, Env,
+    token, Env, FromVal, IntoVal,
 };
 
 struct Fixture<'a> {
@@ -20,6 +21,7 @@ struct Fixture<'a> {
     rep: ReputationContractClient<'a>,
     rewards: RewardsContractClient<'a>,
     quest: QuestRegistryContractClient<'a>,
+    quest_id: Address,
     usdc: Address,
     rewards_id: Address,
     attester: Address,
@@ -59,8 +61,9 @@ fn setup_in(env: Env) -> Fixture<'static> {
 
     let rewards_id = env.register(RewardsContract, ());
     let rewards = RewardsContractClient::new(&env, &rewards_id);
+    // Not wired to the QuestRegistry: like a deployed contract upgraded before
+    // `set_quest_registry` runs. Streak tests wire it with `streak_setup()`.
     rewards.init(&admin, &usdc, &rep_id);
-    rewards.set_quest_registry(&quest_id);
 
     // Fund the rewards treasury with USDC.
     token::StellarAssetClient::new(&env, &usdc).mint(&rewards_id, &1_000);
@@ -70,6 +73,7 @@ fn setup_in(env: Env) -> Fixture<'static> {
         rep,
         rewards,
         quest,
+        quest_id,
         usdc,
         rewards_id,
         attester,
@@ -78,11 +82,14 @@ fn setup_in(env: Env) -> Fixture<'static> {
     }
 }
 
+/// Award `quest_id` the way the off-chain attester does: an ed25519 signature over the
+/// QuestRegistry's payload. Advances the recipient's weekly streak.
 fn award_quest(f: &Fixture, quest_id: u32, recipient: &Address) {
     let payload = f.quest.quest_payload(&quest_id, recipient);
     let msg: std::vec::Vec<u8> = payload.iter().collect();
     let sig = BytesN::from_array(&f.env, &f.attester_sk.sign(&msg).to_bytes());
-    f.quest.award_quest(&f.attester_pub, &sig, &quest_id, recipient);
+    f.quest
+        .award_quest(&f.attester_pub, &sig, &quest_id, recipient);
 }
 
 #[test]
@@ -333,12 +340,17 @@ const REWARDS_WASM: &[u8] = include_bytes!("../testdata/alvinmunk_rewards.wasm")
 fn upgrade_to_identical_wasm_preserves_reward_table_and_treasury() {
     let f = setup();
     f.rewards.add_reward(&1u32, &30u64, &50i128);
+    f.rewards.add_reward(&2u32, &30u64, &50i128);
+    f.rewards.set_quest_registry(&f.quest_id);
+    f.rewards.set_reward_min_streak(&2u32, &2u32);
 
     let hash = f.env.deployer().upload_contract_wasm(REWARDS_WASM);
     f.rewards.upgrade(&hash);
 
     let r = f.rewards.get_reward(&1u32).unwrap();
     assert_eq!((r.threshold, r.amount, r.active), (30, 50, true));
+    assert_eq!(f.rewards.get_quest_registry(), Some(f.quest_id.clone()));
+    assert_eq!(f.rewards.get_reward_min_streak(&2u32), 2);
 
     // The upgraded contract still pays the stored amount from the same treasury.
     let user = Address::generate(&f.env);
@@ -457,28 +469,45 @@ fn supply_for_an_unknown_reward_reverts() {
     );
 }
 
-#[test]
-fn streak_gated_reward_claimed_with_live_streak() {
+// --- Streak-gated rewards (#294): Rewards -> QuestRegistry `get_streak` ---
+
+const WEEK: u64 = 604_800;
+
+/// `setup()` with the rewards contract wired to the QuestRegistry and quests 1-4 (10 XP
+/// each), so a wallet's streak comes from real `award_quest` calls.
+fn streak_setup() -> Fixture<'static> {
     let f = setup();
+    f.rewards.set_quest_registry(&f.quest_id);
+    for id in 1..=4u32 {
+        f.quest.create_quest(&id, &2u32, &10u64);
+    }
+    f
+}
+
+fn at_week(f: &Fixture, week: u64) {
+    f.env.ledger().with_mut(|l| l.timestamp = week * WEEK);
+}
+
+/// A wallet that completes one quest in each of `weeks` (quest ids 1.. in order).
+fn streaker(f: &Fixture, weeks: &[u64]) -> Address {
     let user = Address::generate(&f.env);
+    for (i, w) in weeks.iter().enumerate() {
+        at_week(f, *w);
+        award_quest(f, i as u32 + 1, &user);
+    }
+    user
+}
 
-    // Register reward 1: 50 XP, 200 USDC, 2-week streak.
-    f.rewards.add_reward(&1u32, &50u64, &200i128);
+#[test]
+fn streak_gated_reward_pays_a_live_streak_at_the_minimum() {
+    let f = streak_setup();
+    f.rewards.add_reward(&1u32, &20u64, &200i128);
     f.rewards.set_reward_min_streak(&1u32, &2u32);
-    assert_eq!(f.rewards.get_reward_min_streak(&1u32), 2);
+    let user = streaker(&f, &[0, 1]); // 20 Earned XP, 2-week streak
 
-    f.quest.create_quest(&1u32, &1u32, &25u64);
-    f.quest.create_quest(&2u32, &2u32, &25u64);
-
-    // Week 0: complete quest 1 -> streak 1, 25 XP.
-    f.env.ledger().with_mut(|l| l.timestamp = 0);
-    award_quest(&f, 1, &user);
-
-    // Week 1: complete quest 2 -> streak 2, 50 XP.
-    f.env.ledger().with_mut(|l| l.timestamp = 604_800);
-    award_quest(&f, 2, &user);
-
-    // Both XP (50 >= 50) and live streak (2 >= 2) met.
+    // Week 2, nothing completed yet this week: the run is still live.
+    at_week(&f, 2);
+    assert_eq!(f.quest.get_streak(&user).weeks, 2);
     f.rewards.claim_reward(&user, &1u32);
 
     let token_c = token::TokenClient::new(&f.env, &f.usdc);
@@ -487,75 +516,109 @@ fn streak_gated_reward_claimed_with_live_streak() {
 }
 
 #[test]
-fn streak_gated_reward_rejected_below_required_streak() {
-    let f = setup();
-    let user = Address::generate(&f.env);
-
-    // Register reward 1: 50 XP, 200 USDC, 3-week streak.
-    f.rewards.add_reward(&1u32, &50u64, &200i128);
+fn streak_gated_reward_rejects_a_streak_below_the_minimum() {
+    let f = streak_setup();
+    f.rewards.add_reward(&1u32, &20u64, &200i128);
     f.rewards.set_reward_min_streak(&1u32, &3u32);
-
-    f.quest.create_quest(&1u32, &1u32, &50u64);
-    // Week 0: complete quest 1 -> 50 XP, but streak = 1.
-    f.env.ledger().with_mut(|l| l.timestamp = 0);
-    award_quest(&f, 1, &user);
+    let user = streaker(&f, &[0, 1]); // clears the XP threshold, streak 2 < 3
 
     assert_eq!(
         f.rewards.try_claim_reward(&user, &1u32),
         Err(Ok(contract_err(Error::StreakTooShort)))
     );
+    let token_c = token::TokenClient::new(&f.env, &f.usdc);
+    assert_eq!(token_c.balance(&user), 0);
+    assert!(!f.rewards.is_claimed(&1u32, &user));
+    assert_eq!(f.rewards.get_reward_stats(&1u32).claims, 0);
+    assert_eq!(f.rewards.get_daily_paid(), 0);
+
+    // One more consecutive week reaches the minimum.
+    at_week(&f, 2);
+    award_quest(&f, 3, &user);
+    f.rewards.claim_reward(&user, &1u32);
+    assert_eq!(token_c.balance(&user), 200);
 }
 
+/// The stored run keeps `weeks = 3` until the next award; `get_streak` reads it as 0 once
+/// a full week is skipped, and so does the gate.
 #[test]
-fn streak_gated_reward_rejected_when_streak_is_lapsed() {
-    let f = setup();
-    let user = Address::generate(&f.env);
-
-    f.rewards.add_reward(&1u32, &50u64, &200i128);
+fn streak_gated_reward_rejects_a_lapsed_streak_with_stale_weeks() {
+    let f = streak_setup();
+    f.rewards.add_reward(&1u32, &20u64, &200i128);
     f.rewards.set_reward_min_streak(&1u32, &2u32);
+    let user = streaker(&f, &[0, 1, 2]); // 3-week run, last completion in week 2
 
-    f.quest.create_quest(&1u32, &1u32, &25u64);
-    f.quest.create_quest(&2u32, &2u32, &25u64);
+    at_week(&f, 4); // week 3 skipped
+    let stored: Streak = f.env.as_contract(&f.quest_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .get(&alvinmunk_quest_registry::DataKey::Streak(user.clone()))
+            .unwrap()
+    });
+    assert_eq!((stored.weeks, stored.last_week), (3, 2)); // stale in storage
+    let live = f.quest.get_streak(&user);
+    assert_eq!((live.weeks, live.best), (0, 3));
+    assert_eq!(
+        f.rewards.try_claim_reward(&user, &1u32),
+        Err(Ok(contract_err(Error::StreakTooShort)))
+    );
 
-    // Week 0: complete quest 1 -> streak 1.
-    f.env.ledger().with_mut(|l| l.timestamp = 0);
-    award_quest(&f, 1, &user);
-
-    // Week 1: complete quest 2 -> streak 2, last_week = 1.
-    f.env.ledger().with_mut(|l| l.timestamp = 604_800);
-    award_quest(&f, 2, &user);
-
-    // Advance to Week 4 (skipped weeks 2 & 3).
-    // quest_registry.get_streak still returns weeks = 2, but last_week (1) < current_week (4) - 1.
-    f.env.ledger().with_mut(|l| l.timestamp = 604_800 * 4);
-
+    // A new run starts at 1 and has to be rebuilt to the minimum.
+    award_quest(&f, 4, &user);
     assert_eq!(
         f.rewards.try_claim_reward(&user, &1u32),
         Err(Ok(contract_err(Error::StreakTooShort)))
     );
 }
 
+/// Rewards without a minimum are unchanged: no streak needed and no QuestRegistry call, so
+/// they keep paying on a contract that was never wired to it.
 #[test]
-fn reward_without_streak_requirement_unchanged() {
-    let f = setup();
-    let user = Address::generate(&f.env);
-
-    // Reward without streak requirement (min_streak == 0).
+fn reward_without_streak_requirement_is_unchanged() {
+    let f = setup(); // no set_quest_registry
+    assert_eq!(f.rewards.get_quest_registry(), None);
     f.rewards.add_reward(&1u32, &50u64, &200i128);
-
-    // User has 50 XP from reputation, but 0 streak on quest_registry.
-    f.rep.award_xp(&f.attester, &user, &2u32, &50u64);
+    let user = earner(&f, 50); // Earned XP only, no streak
 
     f.rewards.claim_reward(&user, &1u32);
-
     let token_c = token::TokenClient::new(&f.env, &f.usdc);
     assert_eq!(token_c.balance(&user), 200);
-    assert!(f.rewards.is_claimed(&1u32, &user));
+    assert_eq!(f.rewards.get_reward_min_streak(&1u32), 0);
+    assert_eq!(f.rewards.get_rewards().get(0).unwrap().min_streak, 0);
+}
+
+/// A gated and an ungated reward side by side: the gate only applies to its own row.
+#[test]
+fn a_streak_gate_applies_only_to_its_reward() {
+    let f = streak_setup();
+    f.rewards.add_reward(&1u32, &10u64, &100i128);
+    f.rewards.add_reward(&2u32, &10u64, &100i128);
+    f.rewards.set_reward_min_streak(&2u32, &2u32);
+    let user = streaker(&f, &[0]); // streak 1
+
+    f.rewards.claim_reward(&user, &1u32);
+    assert_eq!(
+        f.rewards.try_claim_reward(&user, &2u32),
+        Err(Ok(contract_err(Error::StreakTooShort)))
+    );
+}
+
+#[test]
+fn a_streak_does_not_replace_the_earned_xp_threshold() {
+    let f = streak_setup();
+    f.rewards.add_reward(&1u32, &100u64, &100i128);
+    f.rewards.set_reward_min_streak(&1u32, &1u32);
+    let user = streaker(&f, &[0, 1]); // streak 2 but only 20 Earned XP
+    assert_eq!(
+        f.rewards.try_claim_reward(&user, &1u32),
+        Err(Ok(contract_err(Error::BelowThreshold)))
+    );
 }
 
 #[test]
 fn get_rewards_reports_min_streak() {
-    let f = setup();
+    let f = streak_setup();
     f.rewards.add_reward(&1u32, &30u64, &50i128);
     f.rewards.add_reward(&2u32, &60u64, &100i128);
     f.rewards.set_reward_min_streak(&1u32, &4u32);
@@ -565,26 +628,91 @@ fn get_rewards_reports_min_streak() {
     assert_eq!((r1.id, r1.min_streak), (1, 4));
     let r2 = rows.get(1).unwrap();
     assert_eq!((r2.id, r2.min_streak), (2, 0));
+    // The stored row keeps its shape; the minimum lives under its own key.
+    assert_eq!(row(&f, 1), Some((30, 50, true)));
 }
 
 #[test]
-fn set_reward_min_streak_zero_clears_requirement() {
-    let f = setup();
-    f.rewards.add_reward(&1u32, &30u64, &50i128);
+fn set_reward_min_streak_zero_clears_the_gate() {
+    let f = streak_setup();
+    f.rewards.add_reward(&1u32, &10u64, &50i128);
     f.rewards.set_reward_min_streak(&1u32, &3u32);
     assert_eq!(f.rewards.get_reward_min_streak(&1u32), 3);
+    let user = streaker(&f, &[0]);
+    assert_eq!(
+        f.rewards.try_claim_reward(&user, &1u32),
+        Err(Ok(contract_err(Error::StreakTooShort)))
+    );
 
     f.rewards.set_reward_min_streak(&1u32, &0u32);
     assert_eq!(f.rewards.get_reward_min_streak(&1u32), 0);
+    let removed = f.env.as_contract(&f.rewards_id, || {
+        f.env.storage().persistent().has(&DataKey::RewardStreak(1))
+    });
+    assert!(!removed);
+    f.rewards.claim_reward(&user, &1u32);
+}
+
+#[test]
+fn set_reward_min_streak_emits_rwd_strk() {
+    let f = streak_setup();
+    f.rewards.add_reward(&1u32, &10u64, &50i128);
+    f.rewards.set_reward_min_streak(&1u32, &3u32);
+    let events = f.env.events().all();
+    let (contract, topics, data) = events.last().unwrap();
+    assert_eq!(contract, f.rewards_id);
+    assert_eq!(
+        topics,
+        soroban_sdk::vec![
+            &f.env,
+            symbol_short!("rwd_strk").into_val(&f.env),
+            1u32.into_val(&f.env)
+        ]
+    );
+    assert_eq!(u32::from_val(&f.env, &data), 3);
+}
+
+#[test]
+fn set_reward_min_streak_needs_the_quest_registry() {
+    let f = setup(); // not wired
+    f.rewards.add_reward(&1u32, &10u64, &50i128);
+    assert_eq!(
+        f.rewards.try_set_reward_min_streak(&1u32, &2u32),
+        Err(Ok(contract_err(Error::QuestRegistryNotSet)))
+    );
+    assert_eq!(f.rewards.get_reward_min_streak(&1u32), 0);
+    // Clearing a gate never needs it.
+    assert_eq!(
+        f.rewards.try_set_reward_min_streak(&1u32, &0u32),
+        Ok(Ok(()))
+    );
+
+    f.rewards.set_quest_registry(&f.quest_id);
+    assert_eq!(f.rewards.get_quest_registry(), Some(f.quest_id.clone()));
+    assert_eq!(
+        f.rewards.try_set_reward_min_streak(&1u32, &2u32),
+        Ok(Ok(()))
+    );
 }
 
 #[test]
 fn set_reward_min_streak_unknown_reward_reverts() {
-    let f = setup();
+    let f = streak_setup();
     assert_eq!(
         f.rewards.try_set_reward_min_streak(&99u32, &3u32),
         Err(Ok(contract_err(Error::RewardNotFound)))
     );
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
+fn non_admin_cannot_set_quest_registry() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let id = env.register(RewardsContract, ());
+    let client = RewardsContractClient::new(&env, &id);
+    client.init(&admin, &Address::generate(&env), &Address::generate(&env));
+    client.set_quest_registry(&Address::generate(&env));
 }
 
 // --- add_reward / set_daily_cap validation (#146) ---
@@ -760,6 +888,9 @@ fn writes_extend_reward_entries_to_bump_extend() {
         let flagged = Address::generate(&f.env);
         f.rewards.add_reward(&1u32, &50u64, &200i128);
         f.rewards.set_reward_supply(&1u32, &5u32);
+        f.rewards.add_reward(&2u32, &50u64, &200i128);
+        f.rewards.set_quest_registry(&f.quest_id);
+        f.rewards.set_reward_min_streak(&2u32, &1u32);
         f.rewards.set_frozen(&flagged, &true);
         f.rewards.set_funded(&user, &true);
         f.rewards.claim_reward(&user, &1u32);
@@ -768,6 +899,7 @@ fn writes_extend_reward_entries_to_bump_extend() {
             DataKey::Reward(1),
             DataKey::RewardIds,
             DataKey::RewardStats(1),
+            DataKey::RewardStreak(2),
             DataKey::RewardClaimed(1, user.clone()),
             DataKey::Frozen(flagged.clone()),
             DataKey::Funded(user.clone()),

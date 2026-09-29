@@ -66,7 +66,9 @@ Or wrap/issue your own SAC and pass that id instead. Without a real SAC id, `dep
 
 ## 3. Deploy contracts (`scripts/deploy-testnet.sh`)
 
-This builds the Wasm, deploys **reputation**, **quest_registry**, and **rewards**, initializes them, and wires attesters (quest contract + your off-chain attester address).
+This builds the Wasm, deploys **reputation**, **quest_registry**, and **rewards**, initializes them, wires attesters (quest contract + your off-chain attester address), and points rewards at quest_registry (`set_quest_registry`) so rewards can require a weekly quest streak.
+
+A rewards contract deployed before streak-gated rewards and then upgraded in place (`upgrade`) has no quest registry set: run `set_quest_registry --quest_registry <quest_registry id>` on it once before giving any reward a streak requirement (`set_reward_min_streak` refuses until then). Its existing rewards keep working without it. The gate relies on `get_streak` reading a lapsed streak as 0, so the quest_registry must run that version too.
 
 ```bash
 USDC_SAC=CAKT2EK2SFGNXTXVSYZLZXA5YB5QPVHLTVUMRHLJTF5RFFAFMIRNPZT2 \
